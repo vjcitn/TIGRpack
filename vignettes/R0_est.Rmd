@@ -1,0 +1,314 @@
+---
+title: "COVID-19 R0 Estimates"
+author: "Rex W. Douglass"
+vignette: >
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteIndexEntry{Estimating R0}
+  %\VignetteEncoding{UTF-8}
+output:
+  html_document:
+    toc: yes
+date: "3/23/2020"
+---
+
+# Introduction
+
+```{r, cache=F, include = T}
+library(here)
+```
+
+
+This document attempts a very crude estimate of COVID-19 R0 using confirmed cases as a proxy for true cases, leveraging data across multiple countries to support a weighted median estimate.
+
+```{r, echo=F, cache=F, include = T}
+print(paste("Last updated ", Sys.Date()))
+```
+
+## Data on Count of Confirmed COVID-19 Cases
+
+Data on confirmed case rate comes from [2019 Novel Coronavirus COVID-19 (2019-nCoV) Data Repository by Johns Hopkins CSSE](https://github.com/CSSEGISandData/COVID-19).
+
+```{r, echo=T, message=FALSE, results = FALSE, warning=FALSE}
+library(tidyverse)
+library(R0)  # consider moving all library commands to top -- this one was in a loop below
+confirmed <- read_csv(url("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_19-covid-Confirmed.csv"))
+deaths <- read_csv(url("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_19-covid-Deaths.csv"))
+recovered <- read_csv(url("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_19-covid-Recovered.csv"))
+confirmed_long <- pivot_longer(confirmed, names_to = "date", cols = ends_with("20"), values_to = "confirmed")
+deaths_long <- pivot_longer(deaths, names_to = "date", cols = ends_with("20"), values_to = "deaths")
+recovered_long <- pivot_longer(recovered, names_to = "date", cols = ends_with("20"), values_to = "recovered")
+library(lubridate)
+all_long <- deaths_long %>% 
+  full_join(confirmed_long) %>% 
+  full_join(recovered_long) %>%
+  filter(confirmed>0) %>% 
+  
+  mutate(date_asdate = mdy(str_replace(date,"20$","2020"))) %>% 
+  rename(country=`Country/Region`, state=`Province/State`) %>%
+  #filter(!state %in% c("From Diamond Princess","Diamond Princess")) %>%
+  mutate(state=ifelse(is.na(state),"none",state)) %>%   
+  mutate(country_state=paste0(country, "___", state) %>% as.factor()  ) %>%
+  
+  arrange(country_state, date_asdate) %>%
+  filter(confirmed>0) %>% #subset to only places/time periods that have had confirmed
+  group_by(country_state) %>%
+  mutate(days_since_1_confirmed=cumsum(confirmed>0)) %>%
+  mutate(confirmed_fd=confirmed-lag(confirmed)) %>%
+  ungroup() %>%
+  filter(days_since_1_confirmed>0) 
+    
+padded <- all_long %>%
+          tidyr::expand(country_state, days_since_1_confirmed) %>% 
+          separate(col=country_state, into=c('country','state'), sep = "___", remove = T) 
+all_long <- padded %>% 
+            left_join(all_long) %>% 
+            arrange(country, state, days_since_1_confirmed) %>%
+            mutate(country_state=paste0(country, "___", state) %>% as.factor()  )
+```
+
+
+Begin study periods on the date of the first reported confirmed COVID-19 case.
+
+```{r}
+library(DT)
+all_long %>% dplyr::select(-country_state,-date_asdate) %>%
+  head(1000) %>% #first 1000 rows
+datatable(rownames = FALSE,
+          options = list(
+            pageLength = 10,
+            columnDefs = list(list(className = 'dt-center', targets = "_all")
+                              )
+            )
+)
+```
+
+## Population Data
+
+Pull population data comes from wikidata.
+
+```{r, echo=T, message=FALSE, results = FALSE, warning=FALSE}
+fromscratch=F
+if(fromscratch){
+  #We need to grab populations
+  places <- all_long %>% dplyr::select(country,state) %>% distinct() %>% mutate(search=paste0(state,", ", country ))  %>% mutate(search= ifelse(is.na(state) | state=="none", country, state ) )
+  library(WikidataR)
+  wiki_searches <- list()
+  for(q in places$search){
+    print(q)
+    try({
+      #wiki <- find_item("Ramsey County")
+      wiki <- find_item(q)
+      temp <- as.data.frame(wiki[[1]])
+      temp$search <- q
+      wiki_searches[[q]] <- temp
+    })
+  }
+  wiki_searches_df <- bind_rows(wiki_searches)
+  
+  item_df <- list()
+  for(q in wiki_searches_df$id){
+    print(q)
+    try({
+      item_df[[q]] <- get_item(id = q)
+    })
+  }
+  wiki <- find_item("New York")
+  
+  latest_pop_list <- list()
+  for(q in names(item_df)){
+    print(q)
+    try({
+      latest_pop_list[[q]] <- data.frame(wikidata_id=q, P1082= rev(item_df[[q]][[1]]$claims$P1082$mainsnak$datavalue$value$amount)[1])
+    })
+  }
+  latest_pop_df <- places %>% left_join(wiki_searches_df %>% dplyr::select(search,wikidata_id=id), by=c('search'='search')) %>% left_join( bind_rows(latest_pop_list) ) %>% 
+    mutate(population= str_replace(P1082,"\\+","") %>% as.numeric()    ) %>%
+    mutate(population_log= log(population)) %>%
+    mutate(state=ifelse(is.na(state),"none",state)) %>% distinct() %>% arrange(country, state) 
+  
+  saveRDS(latest_pop_df,paste0(here::here(),"/data_in/latest_pop_df.RDS"))
+}
+#latest_pop_df <- readRDS(paste0(here::here(), "/data_in/latest_pop_df.RDS"))
+all_long_covariates <- all_long %>% 
+                       left_join(TIGRpack::mar23_pop_df) %>% 
+                       arrange(country, state, days_since_1_confirmed) 
+```
+
+```{r}
+library(DT)
+TIGRpack::mar23_pop_df %>% dplyr::select(-search, -population_log) %>%
+datatable(rownames = FALSE,
+          options = list(
+            pageLength = 10,
+            columnDefs = list(list(className = 'dt-center', targets = "_all")
+                              )
+            )
+)
+```
+
+
+# Estimating R0
+
+## Estimating with a log linear model
+
+Experimenting with alternate estimation using epitrix  packages.
+
+https://www.repidemicsconsortium.org/epitrix/
+
+```{r}
+library(epitrix) #install.packages("epitrix")
+mu <- 3.96 #15.3 # mean in days days
+sigma <- 4.75 #9.3 # standard deviation in days
+cv <- sigma/mu # coefficient of variation
+cv
+param <- gamma_mucv2shapescale(mu, cv) # convertion to Gamma parameters
+param
+si <- distcrete::distcrete("gamma", interval = 1,
+               shape = param$shape,
+               scale = param$scale, w = 0)
+si
+set.seed(1)
+x <- si$r(500)
+head(x, 10)
+hist(x, col = "grey", border = "white",
+     xlab = "Days between primary and secondary onset",
+     main = "Simulated serial intervals")
+si_fit <- fit_disc_gamma(x)
+si_fit
+library(outbreaks) #install.packages('outbreaks')
+library(incidence) #install.packages('incidence')
+locations <- all_long_covariates$country_state
+r_log_linear_list <- list()
+for(q in locations %>% unique() ){
+#  print(q)
+suppressMessages({
+suppressWarnings({
+  try({
+    temp <- all_long_covariates %>% filter(country_state %in% q) %>% filter(!is.na(confirmed) )
+    temp$confirmed_fd[1]<-temp$confirmed[1]
+    incidents <- lapply(temp$days_since_1_confirmed[temp$confirmed_fd>0], FUN=function(x) { rep(temp$days_since_1_confirmed[x],temp$confirmed_fd[x]) } ) #print(x) ;
+    incidents <- unlist( incidents )
+    i <- incidence(incidents)
+    i
+    peak <- which(cummean(i$counts)==max(cummean(i$counts)))
+    
+    f <- fit(i[1:peak])  #fit the curve to the peak mean incidents
+    plot(i, fit = f, color = "#9fc2fc")
+    
+    r_log_linear=r2R0(f$info$r, si$d(1:100))
+    
+    r_log_linear_list[[q]] <- data.frame(country=temp$country[1],state=temp$state[1], r_log_linear=round(r_log_linear,2 ))
+  }, silent=TRUE)
+ }) # suppress Warnings end
+ }) # suppress Messages end
+}
+r_log_linear_df <- bind_rows(r_log_linear_list)
+```
+
+## Estimating with the R0 package
+
+A critical assumption is the serial interval of the disease. [Du et al. March 20, 2020](https://www.medrxiv.org/content/10.1101/2020.02.19.20025452v4) report a serial interval of 3.96 days with standard deviation of 4.75 days. Nishiura et al March 4, 2020 find a median of 4.0. [WHO's literature review](https://www.who.int/docs/default-source/coronaviruse/situation-reports/20200219-sitrep-30-covid-19.pdf?sfvrsn=3346b04f_2) reports an incubation period of 5-6 days and serial interval from 4.4 to 7.5 days. Many simulations go with the early January 29, 2020 estimate from [Li et al.](https://www.nejm.org/doi/10.1056/NEJMoa2001316) of a mean serial interval of 7.5 days.
+
+```{r}
+#https://bmcmedinformdecismak.biomedcentral.com/articles/10.1186/1472-6947-12-147
+#The generation time is the time lag between infection in a primary case and a secondary case. The generation time distribution should be obtained from the time lag between all infectee/infector pairs [8]. As it cannot be observed directly, it is often substituted with the serial interval distribution that measures time between symptoms onset. In our software package, the ‘generation.time’ function is used to represent a discretized generation time distribution. Discretization is carried out on the grid [0,0.5), [0.5, 1.5), [1.5, 2.5), etc.… where the unit is a user chosen time interval (hour, day, week…). Several descriptions are supported: “empirical” requiring the full specification of the distribution, or parametric distributions taken among “gamma”, “lognormal” or “weibull”. In the latter case, the mean and standard deviation must be provided in the desired time units.
+library(R0)
+mGT<-generation.time("gamma", 
+                     #Du et al. "The reported serial intervals range from -11 days to 20 days, with a mean of 3.96 days (95% confidence interval: 3.53-4.39), a standard deviation of 4.75 days (95% confidence interval: 4.46-5.07), "
+                     val=c(
+                       3.96,#Serial interval mean
+                       4.75 #Serial interval standard deviation
+                       ) #"val	Vector of values used for the empirical distribution, or c(mean, sd) if parametric."
+                     )
+```
+
+R0 estimates generated with the R package [R0](https://cran.r-project.org/web/packages/R0/index.html)
+
+"The R0 package: a toolbox to estimate reproduction numbers for epidemic outbreaks" [Obadia et al. 2012](https://bmcmedinformdecismak.biomedcentral.com/articles/10.1186/1472-6947-12-147)
+
+```{r, echo=T, message=FALSE, results = FALSE, warning=FALSE}
+#Note many of these will throw errors for lack of data
+locations <- all_long_covariates$country_state
+r_R0_list <- list()
+for(q in locations %>% unique() ){
+#  print(q)
+suppressMessages({
+ suppressWarnings({
+  try({
+    temp <- all_long_covariates %>% filter(country_state %in% q) %>% filter(!is.na(confirmed))
+    temp$confirmed_fd[1]<-temp$confirmed[1]
+    
+    incidents <- as.vector(temp$confirmed_fd )
+    pop <- temp$population[1]
+    estR0<-est.R0.ML(
+          epid=incidents, 
+          GT=mGT, 
+          begin=1,
+          #end=length(incidents), 
+          methods="ML", #c("EG", "ML", "TD", "AR", "SB"),
+          pop.size=pop, #Population size in which the incident cases were observed. See more details in est.R0.AR documentation
+          impute.values=F #incidents[1]>10 #if the data start with more than 10 confirmed cases immediately then assume left censor and impute #imputation is really slow
+    )
+    #attributes(estR0)
+    estR0
+    r_R0_list[[q]] <- data.frame(country=temp$country[1],state=temp$state[1], r_ml=round(estR0$R,2), pop=pop, R2= round(estR0$Rsquared,2))
+  })
+ }) # end warnings suppression
+ }) # end messages suppression
+}
+r_R0_df <- bind_rows(r_R0_list)
+```
+
+# Summary
+
+Simple log linear model
+
+```{r}
+weights <- table(r_log_linear_df$country)
+weights <- weights[r_log_linear_df$country]
+weights <- 1/(weights/max(weights))
+library(spatstat) #install.packages('spatstat')
+print(results_log_linear <- r_log_linear_df %>% filter(!is.na(pop)) %>% pull(r_log_linear) %>% weighted.quantile(w=weights)) #weight by country, exclude obs with no population data.
+```
+
+Quantiles of R0 across locations downweighting multiple observations from countries that are dissagregated arbitarily by the data source. A median of R0=2.56 .
+
+```{r}
+weights <- table(r_R0_df$country)
+weights <- weights[r_R0_df$country]
+weights <- 1/(weights/max(weights))
+library(spatstat) #install.packages('spatstat')
+print(results_R0 <- r_R0_df %>% filter(!is.na(pop)) %>% pull(r_ml) %>% weighted.quantile(w=weights)) #weight by country, exclude obs with no population data.
+```
+
+Distribution of R0 across locations.
+
+```{r, echo=T, message=FALSE, results = FALSE, warning=FALSE}
+r_estimates_all <- r_log_linear_df %>% full_join(r_R0_df)
+r_estimates_all %>% 
+        filter(!is.na(pop)) %>% 
+        ggplot() + 
+        geom_density(aes(x=r_log_linear), col="lightblue") + geom_vline(xintercept = results_log_linear[3], stat = 'vline', linetype = "dashed", col="blue") + 
+        geom_density(aes(x=r_ml), col="pink") + geom_vline(xintercept = results_R0[3], stat = 'vline', linetype = "dashed", col="red") + 
+        ggtitle("Distribution R0 Estimates Across Countries") + 
+        theme_bw() +
+        scale_x_continuous(breaks=seq(0, 30, by = 1)) + 
+        annotate("text", x = 7, y = .75, label = "Median R0_log_linear = 1.64", color="blue") +
+        annotate("text", x = 7, y = .5, label = "Median R0_ML = 2.56", color="red") +
+        xlab("R0 (maximum likelihood estimate)")
+```
+
+Raw Estimates
+
+```{r}
+library(DT)
+r_estimates_all %>%
+  mutate(r_ml= round(r_ml,2)) %>%
+datatable(rownames = FALSE,
+          options = list(
+            pageLength = 50,
+            columnDefs = list(list(className = 'dt-center', targets = "_all")
+                              )
+            )
+)
+```

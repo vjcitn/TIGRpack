@@ -1,0 +1,16 @@
+Package: TIGRpack
+Title: Crowd-sourced COVID-19 Dataset Tracking Involuntary Government Restrictions
+Description: Provide infrastructure for Crowd-sourced COVID-19 Dataset Tracking Involuntary Government Restrictions project.
+Version: 0.0.1
+Author: Rex Douglass
+Suggests: knitr, R0, DT, tidyverse, here, epitrix,
+	spatstat, outbreaks, incidence, WikidataR, lubridate,
+	distcrete, tidyr, dplyr
+Depends: R (>= 3.6.0)
+Maintainer: VJ Carey <stvjc@channing.harvard.edu>
+License: Artistic-2.0
+LazyLoad: yes 
+LazyData: yes 
+VignetteBuilder: knitr
+Encoding: UTF-8
+RoxygenNote: 7.1.0
